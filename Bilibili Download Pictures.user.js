@@ -11,6 +11,7 @@
 // @supportURL   https://github.com/owendswang/Download-Pictures-from-Bilibili-Timeline/issues
 // @match        https://t.bilibili.com/*
 // @match        https://space.bilibili.com/*/dynamic*
+// @match        https://space.bilibili.com/*/upload/opus*
 // @match        https://www.bilibili.com/opus/*
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/v/topic/detail?*
@@ -29,6 +30,7 @@
 // @grant        GM_setValue
 // @grant        GM_cookie
 // @grant        GM_registerMenuCommand
+// @grant        unsafeWindow
 // @require      https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js
 // @namespace https://greasyfork.org/users/738244
 // @downloadURL https://update.greasyfork.org/scripts/421885/Bilibili%20Download%20Pictures%20and%20Videos.user.js
@@ -111,6 +113,31 @@
             }, seconds * 1000);
         });
     }
+
+    // 投稿图文页瀑布流分页状态：钩住页面自身的feed请求，确定性记录has_more与游标；后台标签页页面不懒加载时，由脚本自行调接口续页，不靠超时猜测结束。
+    const realWindow = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+    const nativeFetch = realWindow.fetch.bind(realWindow);
+    const opusFeedState = { seen: false, page: 0, offset: '', hasMore: true, type: 'all', hostMid: null, apiDriven: false };
+    realWindow.fetch = function(input, init) {
+        const promise = nativeFetch(input, init);
+        try {
+            const url = (typeof input === 'string') ? input : input?.url;
+            if (url && url.includes('/opus/feed/space') && !opusFeedState.apiDriven) {
+                const params = new URL(url, location.href).searchParams;
+                promise.then((response) => response.clone().json().then((data) => {
+                    if (data?.code === 0 && data.data) {
+                        opusFeedState.seen = true;
+                        opusFeedState.page = Number(params.get('page')) || opusFeedState.page;
+                        opusFeedState.offset = data.data.offset || '';
+                        opusFeedState.hasMore = !!data.data.has_more;
+                        opusFeedState.type = params.get('type') || 'all';
+                        opusFeedState.hostMid = params.get('host_mid') || opusFeedState.hostMid;
+                    }
+                }).catch(() => {})).catch(() => {});
+            }
+        } catch(e) { console.error(e); }
+        return promise;
+    };
 
 /*
   Third-party libraries used in this script:
@@ -226,9 +253,10 @@
                 // console.log('oXMLHttpRequest finished: ' + url);
                 resolve(oReq.response);
             };
-            oReq.onerror = (e) => { console.log(e); alert('请求失败！'); resolve(null); };
-            oReq.onabort = (e) => { console.log(e); alert('请求被中断！'); resolve(null); };
-            oReq.ontimeout = (e) => { console.log(e); alert('请求超时！'); resolve(null); };
+            // 瀑布流模式下不弹模态框（错误由上层非模态提示或封面过滤兑底处理），避免阻塞页面。
+            oReq.onerror = (e) => { console.log(e); if (!listDownloading) alert('请求失败！'); resolve(null); };
+            oReq.onabort = (e) => { console.log(e); if (!listDownloading) alert('请求被中断！'); resolve(null); };
+            oReq.ontimeout = (e) => { console.log(e); if (!listDownloading) alert('请求超时！'); resolve(null); };
             oReq.send(null);
         });
     }
@@ -268,9 +296,9 @@
                         resolve(response);
                     }
                 },
-                onabort: function(e) { console.log(e); alert('请求失败！'); resolve(null); },
-                onerror: function(e) { console.log(e); alert('请求被中断！'); resolve(null); },
-                ontimeout: function(e) { console.log(e); alert('请求超时！'); resolve(null); },
+                onabort: function(e) { console.log(e); if (!listDownloading) alert('请求失败！'); resolve(null); },
+                onerror: function(e) { console.log(e); if (!listDownloading) alert('请求被中断！'); resolve(null); },
+                ontimeout: function(e) { console.log(e); if (!listDownloading) alert('请求超时！'); resolve(null); },
             });
         });
     }
@@ -341,6 +369,76 @@
         // setTimeout(() => { progress.remove(); if(downloadQueueCard.childElementCount == 1) downloadQueueTitle.style.display = 'none'; }, 1000);
     }
 
+    let folderHandle = null;
+    let folderHandleLoaded = false;
+
+    function openFolderDb() {
+        return new Promise(function(resolve, reject) {
+            const req = indexedDB.open('bilibili-download-folder', 1);
+            req.onupgradeneeded = () => req.result.createObjectStore('handles');
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+        });
+    }
+
+    async function getFolderHandle() {
+        // 从IndexedDB加载用户选过的目录句柄（FileSystemDirectoryHandle可结构化克隆持久化），只加载一次。
+        if (!folderHandleLoaded) {
+            folderHandleLoaded = true;
+            try {
+                const db = await openFolderDb();
+                folderHandle = await new Promise(function(resolve, reject) {
+                    const req = db.transaction('handles').objectStore('handles').get('dirHandle');
+                    req.onsuccess = () => resolve(req.result || null);
+                    req.onerror = () => reject(req.error);
+                });
+                db.close();
+            } catch(e) { console.error(e); }
+        }
+        return folderHandle;
+    }
+
+    async function saveFolderHandle(handle) {
+        folderHandle = handle;
+        folderHandleLoaded = true;
+        const db = await openFolderDb();
+        await new Promise(function(resolve, reject) {
+            const tx = db.transaction('handles', 'readwrite');
+            tx.objectStore('handles').put(handle, 'dirHandle');
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+        });
+        db.close();
+    }
+
+    async function ensureFolderPermission() {
+        // 需在用户手势（点击下载按钮/确定保存设置）内尽早调用；刷新页面后授权会降为prompt，需借手势重新申请；失败则静默，保存时自动退回浏览器下载。
+        if (!GM_getValue('saveToFolderEnabled', false) || typeof showDirectoryPicker !== 'function') return;
+        try {
+            const handle = await getFolderHandle();
+            if (!handle) return;
+            if (await handle.queryPermission({ mode: 'readwrite' }) === 'granted') return;
+            await handle.requestPermission({ mode: 'readwrite' });
+        } catch(e) { console.error(e); }
+    }
+
+    async function saveBlobToFile(blob, name) {
+        // 统一保存入口：启用且已授权时直接写入用户指定文件夹（不经浏览器下载、无保存弹窗，同名覆盖）；任何失败都退回浏览器下载，绝不丢文件。
+        if (GM_getValue('saveToFolderEnabled', false)) {
+            try {
+                const handle = await getFolderHandle();
+                if (handle && await handle.queryPermission({ mode: 'readwrite' }) === 'granted') {
+                    const fileHandle = await handle.getFileHandle(name, { create: true });
+                    const writable = await fileHandle.createWritable();
+                    await writable.write(blob);
+                    await writable.close();
+                    return;
+                }
+            } catch(e) { console.error(e); }
+        }
+        saveAs(blob, name);
+    }
+
     function downloadWrapper(url, name, responseType = 'blob') {
         // console.log('downloadWrapper: ', url, name);
         downloadQueueTitle.style.display = 'block';
@@ -399,7 +497,7 @@
                 progress.style.background = 'linear-gradient(to right, green ' + percent + '%, transparent ' + percent + '%)';
                 progress.firstChild.textContent = progressName + ' [' + percent.toFixed(0) + '%]';
             };
-            oReq.onload = (e) => {
+            oReq.onload = async (e) => {
                 const timeout = setTimeout(() => {
                     progress.remove();
                     if(downloadQueueCard.childElementCount == 1) downloadQueueTitle.style.display = 'none';
@@ -413,7 +511,7 @@
                 if (responseType === 'arraybuffer') {
                     resolve(oReq.response);
                 } else {
-                    saveAs(oReq.response, name);
+                    await saveBlobToFile(oReq.response, name);
                     resolve(true);
                 }
             };
@@ -544,11 +642,29 @@
         return setName.replace(/[<|>|*|"|\/|\\|\||:|?|\n]/g, '_');
     }*/
 
+    function getDynamicTitle(item) {
+        // 动态标题：图文取正文第一行非空文本（与图文页卡片标题一致），视频/直播优先取展示标题；无标题返回空串由调用方兑底。
+        const major = item.modules.module_dynamic.major;
+        const title = major?.opus?.title || major?.archive?.title || major?.live_rcmd?.title || (major?.opus?.summary?.text || '').split('\n').find((line) => line.trim());
+        return (title || '').trim().replace(/\s+/g, ' ').substring(0, 60);
+    }
+
+    // 会话级标题占用表：记录每个“标题+扩展名”由哪个原文件名首先占用，重名时后来者追加原文件名作后缀；同一文件重试仍用同名，不会越试越长。
+    const titleNameOwners = new Map();
+
     function getPicName(nameSetting, originalName, index, item) {
         const author = item.modules.module_author;
         const dynamic = item.modules.module_dynamic;
+        // {title}命名冲突处理：标题名被别的图片占用时，把原文件名作为后缀追加，避免相互覆盖；模板已含{index}或{original}时天然不重名，不做处理。
+        let effectiveSetting = nameSetting;
+        const dynamicTitle = getDynamicTitle(item);
+        if (nameSetting.includes('{title}') && !nameSetting.includes('{index}') && !nameSetting.includes('{original}') && dynamicTitle) {
+            const titleKey = dynamicTitle.replace(/[<|>|*|"|\/|\\|\||:|?|\n]/g, '_') + '|' + originalName.split('.')[1];
+            if (!titleNameOwners.has(titleKey)) titleNameOwners.set(titleKey, originalName);
+            else if (titleNameOwners.get(titleKey) !== originalName) effectiveSetting = nameSetting.replace('{title}', '{title}-{original}');
+        }
         // console.log(card);
-        let setName = nameSetting;
+        let setName = effectiveSetting;
         setName = setName.replace('{original}', originalName.split('.')[0]);
         setName = setName.replace('{ext}', originalName.split('.')[1]);
         const userName = author.name;
@@ -561,6 +677,8 @@
         setName = setName.replace('{dynamicid}', dynamicId);
         setName = setName.replace('{index}', index);
         setName = setName.replace('{content}', content.substring(0, 25));
+        // {title}：动态标题；无标题时退回原文件名（只替换文件名部分，保留扩展名）。
+        setName = setName.replace('{title}', dynamicTitle || originalName.split('.')[0]);
         let YYYY, MM, DD, HH, mm, ss;
         const postAt = new Date(author.pub_ts * 1000);
         YYYY = postAt.getFullYear().toString();
@@ -636,18 +754,91 @@
         }
     }*/
 
+    function orientationAllowedByRatio(width, height) {
+        // 图片方向过滤：高小于宽为横图，高大于宽为竖图，高宽相等为方图。
+        if (width > height) return GM_getValue('enableDownloadLandscapePic', true);
+        if (height > width) return GM_getValue('enableDownloadPortraitPic', true);
+        return GM_getValue('enableDownloadSquarePic', true);
+    }
+
+    function coverOrientationAllowedFromItem(item) {
+        // 方向过滤只看封面（详情API里的第一张图），整条动态判定，不逐张考虑内部其它图；宽高缺失时无法判断，放行。
+        const major = item.modules.module_dynamic.major;
+        const cover = major.opus?.pics?.[0] || major.draw?.items?.[0];
+        if (!(cover?.width > 0) || !(cover?.height > 0)) return true;
+        return orientationAllowedByRatio(cover.width, cover.height);
+    }
+
     async function handleImageDynamic(item) {
         const pictures = item.modules.module_dynamic.major.opus.pics || item.modules.module_dynamic.major.draw.items;
         // console.log(pictures);
         if (Array.isArray(pictures)) {
+            // 封面方向被过滤时整条按“跳过”处理，不标记已下载；封面通过则下载全部图片。
+            if (pictures.length > 0 && !coverOrientationAllowedFromItem(item)) return true;
             await Promise.all(pictures.map(function(picture, index) {
                 // console.log(picture);
                 const pictureUrl = picture.url || picture.src;
                 const originalName = pictureUrl.split('/')[pictureUrl.split('/').length - 1];
-                const pictureName = getPicName(GM_getValue('dlPicName', '{original}.{ext}'), originalName, index + 1, item);
+                const pictureName = getPicName(GM_getValue('dlPicName', '{title}.{ext}'), originalName, index + 1, item);
                 return downloadWrapper(pictureUrl, pictureName);
             }));
         }
+    }
+
+    async function handleArticleOpusDynamic(item) {
+        // 专栏型opus的详情API只返回封面图，正文图片需从opus页面的服务端渲染HTML中解析。
+        // 方向过滤只看封面（详情API的opus.pics[0]即封面）：被过滤则整条跳过，连专栏页面请求都不发。
+        if (!coverOrientationAllowedFromItem(item)) return true;
+        const dynId = item.id_str;
+        downloadQueueTitle.style.display = 'block';
+        const progress = downloadQueueCard.appendChild(progressBar.cloneNode(true));
+        progress.lastChild.remove();
+        const progressName = '获取专栏图片列表';
+        progress.firstChild.textContent = progressName + ' [0%]';
+        const html = await gmXMLHttpRequest('https://www.bilibili.com/opus/' + dynId, 'text', progress, progressName);
+        progress.remove();
+        if (downloadQueueCard.childElementCount == 1) downloadQueueTitle.style.display = 'none';
+        if (!html) throw new Error('无法获取专栏页面: ' + dynId);
+        const pictureList = [];
+        const seenUrls = new Set();
+        const pushPicture = (rawUrl) => {
+            let pictureUrl = (rawUrl || '').split('@')[0];
+            if (pictureUrl.startsWith('//')) pictureUrl = 'https:' + pictureUrl;
+            if (!pictureUrl.startsWith('http://') && !pictureUrl.startsWith('https://')) return;
+            // 过滤B站专栏通用的分割线装饰图（全站固定哈希，与正文图在DOM上无结构差异）。
+            if (pictureUrl.includes('02db465212d3c374a43c60fa2625cc1caeaab796')) return;
+            if (seenUrls.has(pictureUrl)) return;
+            seenUrls.add(pictureUrl);
+            pictureList.push(pictureUrl);
+        };
+        // 优先从页面注入的 __INITIAL_STATE__ 段落数据取正文图，比解析渲染DOM可靠。
+        let paragraphs = null;
+        const stateMatch = html.match(/window\.__INITIAL_STATE__\s*=\s*(\{.*?\});\s*\(function/);
+        if (stateMatch) {
+            try {
+                const state = JSON.parse(stateMatch[1]);
+                paragraphs = state?.detail?.modules?.find((module) => Array.isArray(module?.module_content?.paragraphs))?.module_content.paragraphs;
+            } catch(e) { console.error(e); }
+        }
+        if (Array.isArray(paragraphs)) {
+            paragraphs.forEach((paragraph) => {
+                (paragraph?.pic?.pics || []).forEach((picture) => pushPicture(picture.url));
+            });
+        } else {
+            // 兜底：直接解析服务端渲染DOM中的正文图片。
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            doc.querySelectorAll('div.opus-para-pic img').forEach((img) => pushPicture(img.getAttribute('src') || img.getAttribute('data-src')));
+        }
+        if (pictureList.length === 0) {
+            // 正文没有图片（纯文字专栏或页面结构变化）时，退回下载API返回的封面图。
+            return await handleImageDynamic(item);
+        }
+        // 封面已通过方向过滤，正文全部图片直接下载，不再逐张判定。
+        await Promise.all(pictureList.map(function(pictureUrl, index) {
+            const originalName = pictureUrl.split('/')[pictureUrl.split('/').length - 1];
+            const pictureName = getPicName(GM_getValue('dlPicName', '{title}.{ext}'), originalName, index + 1, item);
+            return downloadWrapper(pictureUrl, pictureName);
+        }));
     }
 
     // For 'https://api.vc.bilibili.com/dynamic_svr/v1/dynamic_svr/get_dynamic_detail?dynamic_id=' + dynId
@@ -725,7 +916,7 @@
         let out = await ffmpeg.readFile(`out_${id}.mp4`);
         await Promise.all([ffmpeg.deleteFile(`v_${id}.m4s`), ffmpeg.deleteFile(`a_${id}.m4s`), ffmpeg.deleteFile(`out_${id}.mp4`)]);
         // console.log(vidName);
-        saveAs(new Blob([out.buffer], { type: 'video/mp4' }), vidName);
+        await saveBlobToFile(new Blob([out.buffer], { type: 'video/mp4' }), vidName);
         progress.style.background = 'linear-gradient(to right, green 100%, transparent 100%)';
         progress.firstChild.textContent = progressName + ' [100%]';
         out = null;
@@ -771,6 +962,7 @@
         if (buttonText) {
             buttonText.textContent = '下载中……';
         }
+        await ensureFolderPermission();
         const vidInfoRes = await getVideoInfo(bvid);
         // console.log(vidInfoRes);
         const success = await downloadVideo(vidInfoRes.data);
@@ -907,16 +1099,30 @@
         }
     }*/
 
+    // 最近一次handleDynamicDownload失败的真实异常，供瀑布流错误弹窗展示（函数内部catch后只返回false，异常本身不向上抛）。
+    let lastDownloadError = null;
+
     // For 'https://api.bilibili.com/x/polymer/web-dynamic/v1/detail?id=' + dynId
-    async function handleDynamicDownload(dynId, downloadButton) {
+    // fallbackCard：可选的卡片DOM；详情请求失败时若其封面方向已被过滤，则静默按跳过处理不报错（该场景本就下载失败，跳过无损失）。
+    async function handleDynamicDownload(dynId, downloadButton, fallbackCard = null) {
         if (downloadButton) {
             downloadButton.textContent = '下载中……';
         }
+        await ensureFolderPermission();
+        lastDownloadError = null;
         // console.log('handleDynamicDownload: ' + dynId);
         try {
             let skipped;
             let dynRes = await getDynamicDetail(dynId);
             // console.log(dynRes.data);
+            if (!dynRes) {
+                // 请求层失败（resolve(null)）：网络错误或风控拦截导致响应非JSON。
+                throw new Error('详情接口请求失败（网络错误或被风控拦截，可稍后重试或登录后再试）');
+            }
+            if (!dynRes.data?.item) {
+                // 接口未返回动态数据（风控/不可见/已删除等），抛出带接口错误码的可读异常。
+                throw new Error('接口未返回动态数据（code ' + (dynRes.code ?? '无') + '：' + (dynRes.message || '无message') + '，可能未登录或动态不可见）');
+            }
             let item = dynRes.data.item;
             if (item.orig) {
                 item = item.orig;
@@ -930,12 +1136,18 @@
             } else if (major.draw || major.opus) {
                 // 图片
                 // console.log('picture');
-                skipped = await handleImageDynamic(item);
+                if (item.type === 'DYNAMIC_TYPE_ARTICLE') {
+                    // 专栏：正文图片不在详情API里，需抓取opus页面。
+                    skipped = await handleArticleOpusDynamic(item);
+                } else {
+                    skipped = await handleImageDynamic(item);
+                }
             } else {
                 // major.live_rcmd // 直播
                 // major.
                 if (!listDownloading) alert('无法下载！');
-                return true;
+                // 无可下载内容，同样不产生真实下载，按跳过处理。
+                return 'skipped';
             }
             if (!skipped) {
                 GM_setValue('blDl-' + dynId, true);
@@ -947,13 +1159,19 @@
                     downloadButton.textContent = '下载';
                 }
             }
-            return true;
+            // 返回'skipped'（仍为真值，不影响成败判定）供瀑布流区分“无真实下载的跳过”，跳过时不必等待下载间隔。
+            return skipped ? 'skipped' : true;
         } catch(e) {
             console.error(e);
+            lastDownloadError = e;
             if (downloadButton) {
                 downloadButton.textContent = GM_getValue('blDl-' + dynId, false) ? '已下载' : '下载';
             }
-            if (!listDownloading) alert('无法下载！');
+            if (coverOrientationFiltered(fallbackCard)) {
+                // 详情失败但封面方向已被过滤：用户本就不想要这个方向的图，静默跳过不报错。
+                return 'skipped';
+            }
+            if (!listDownloading) alert('下载出错：' + (e?.message || e || '未知错误'));
             return false;
         }
     }
@@ -1004,6 +1222,82 @@
             });
             buttonBar.appendChild(downloadButton);
         }
+    }
+
+    function getOpusFeedCardId(card) {
+        // 从投稿图文页卡片的链接中提取动态id（封面与标题链接均指向 www.bilibili.com/opus/<id> 或 t.bilibili.com/<id>）。
+        const link = card.querySelector('a.opus-card__cover[href], a.opus-card__title[href]') || card.querySelector('a[href]');
+        const href = link?.getAttribute('href') || '';
+        return href.match(/\/opus\/(\d+)/)?.[1] || href.match(/t\.bilibili\.com\/(\d+)/)?.[1] || null;
+    }
+
+    function getCardTitle(card) {
+        // 提取卡片可读标题，供错误弹窗定位出错的动态：依次尝试图文页标题、时间线视频卡标题、时间线图文卡正文。
+        const titleEle = card.querySelector('a.opus-card__title, .bili-dyn-card-video__title, div.dyn-card-opus .bili-rich-text, div.dyn-card-opus');
+        const title = (titleEle?.textContent || '').trim().replace(/\s+/g, ' ');
+        return title ? (title.length > 30 ? title.substring(0, 30) + '…' : title) : '（无标题）';
+    }
+
+    function coverOrientationFiltered(contentDom) {
+        // 用卡片上已加载的封面缩略图判断方向是否被过滤（零请求；缩略图比例是原图比例夹逼到[75%,131%]，方向判定可靠）。过滤只看封面，命中则整条跳过，不考虑内部其它图。
+        if (!contentDom || contentDom.querySelector('a.bili-dyn-card-video, div.bili-dyn-card-video')) return false;
+        const coverImg = [...contentDom.querySelectorAll('img')].find((img) => img.complete && img.naturalWidth > 0 && img.naturalHeight > 0 && /new_dyn|\/bfs\/article\//.test(img.src));
+        if (!coverImg) return false;
+        return !orientationAllowedByRatio(coverImg.naturalWidth, coverImg.naturalHeight);
+    }
+
+    function addOpusFeedDownloadButton(card) {
+        // 投稿图文页（space.bilibili.com/<uid>/upload/opus）瀑布流卡片：在封面右上角悬浮一个小下载按钮。
+        if (card.getElementsByClassName('download-button').length > 0) return;
+        const dynId = getOpusFeedCardId(card);
+        if (!dynId) return; // 文集卡片等非图文动态卡片没有opus链接，跳过。
+        if (getComputedStyle(card).position === 'static') card.style.position = 'relative';
+        let downloadButton = document.createElement('div');
+        downloadButton.classList.add('download-button');
+        downloadButton.style.position = 'absolute';
+        downloadButton.style.top = '0.3rem';
+        downloadButton.style.right = '0.3rem';
+        downloadButton.style.zIndex = '2';
+        downloadButton.style.display = 'flex';
+        downloadButton.style.alignItems = 'center';
+        downloadButton.style.gap = '2px';
+        downloadButton.style.padding = '0.1rem 0.4rem';
+        downloadButton.style.borderRadius = '0.3rem';
+        downloadButton.style.backgroundColor = 'rgba(0, 0, 0, 0.55)';
+        downloadButton.style.color = 'white';
+        downloadButton.style.fontSize = '0.75rem';
+        downloadButton.style.lineHeight = '1.2rem';
+        downloadButton.style.cursor = 'pointer';
+        let icon = document.createElement('i');
+        icon.style.width = '14px';
+        icon.style.height = '14px';
+        icon.style.backgroundImage = downloadIcon;
+        icon.style.backgroundRepeat = 'no-repeat';
+        icon.style.backgroundSize = '100% 100%';
+        icon.style.backgroundPosition = 'center';
+        let text = document.createElement('span');
+        text.textContent = GM_getValue('blDl-' + dynId, false) ? '已下载' : '下载';
+        downloadButton.appendChild(icon);
+        downloadButton.appendChild(text);
+        downloadButton.addEventListener('mouseover', function(event) {
+            this.style.backgroundColor = 'rgba(0, 0, 0, 0.8)';
+        });
+        downloadButton.addEventListener('mouseout', function(event) {
+            this.style.backgroundColor = 'rgba(0, 0, 0, 0.55)';
+        });
+        downloadButton.addEventListener('click', async function(event) {
+            event.preventDefault();
+            event.stopPropagation();
+            // 点击时重新解析id，避免子tab切换时Vue复用卡片节点导致按钮创建时捕获的id过期。
+            const card = this.closest('div.opus-card');
+            const currentDynId = getOpusFeedCardId(card) || dynId;
+            if (coverOrientationFiltered(card)) {
+                // 封面方向已被过滤：整条跳过，零请求。
+                return;
+            }
+            await handleDynamicDownload(currentDynId, this.querySelector('span'), card);
+        });
+        card.appendChild(downloadButton);
     }
 
     function checkDynDownloaded(card) {
@@ -1285,6 +1579,12 @@
                     notLoaded = false;
                     // document.body.removeEventListener('mouseover', bodyMouseOver);
                 }
+            } else if (document.body.querySelector('div.opus-feed div.opus-card')) {
+                // 投稿图文页的瀑布流卡片。
+                document.body.querySelectorAll('div.opus-feed div.opus-card').forEach((card) => {
+                    addOpusFeedDownloadButton(card);
+                });
+                notLoaded = false;
             } /* else if (GM_getValue('enableVideoDownload', true) && document.body.querySelector('div.video-toolbar-left-main')) {
                 const buttonBar = document.body.querySelector('div.video-toolbar-left-main');
                 if (buttonBar) {
@@ -1357,10 +1657,10 @@
         inputPicName.style.borderColor = 'gray';
         inputPicName.style.borderWidth = '0.14rem';
         inputPicName.style.borderRadius = '0.2rem';
-        inputPicName.defaultValue = GM_getValue('dlPicName', '{original}.{ext}');
+        inputPicName.defaultValue = GM_getValue('dlPicName', '{title}.{ext}');
         question1.appendChild(inputPicName);
         let PicNameExplain1 = document.createElement('p');
-        PicNameExplain1.innerHTML = '{original} - 原文件名\n{username} - UP主名称\n{userid} - UP主ID\n{dynamicid} - 动态id\n{ext} - 文件后缀\n{index} - 图片序号\n{YYYY} {MM} {DD} {HH} {mm} {ss} - 原博发布时\n间的年份、月份、日期、小时、分钟、秒，可\n分开独立使用\n{content} - 动态文字内容（最多前25个字符）';
+        PicNameExplain1.innerHTML = '{title} - 动态标题（最多前60个字符；无标\n题时用原文件名，重名时追加原文件名作后缀）\n{original} - 原文件名\n{username} - UP主名称\n{userid} - UP主ID\n{dynamicid} - 动态id\n{ext} - 文件后缀\n{index} - 图片序号\n{YYYY} {MM} {DD} {HH} {mm} {ss} - 原博发布时\n间的年份、月份、日期、小时、分钟、秒，可\n分开独立使用\n{content} - 动态文字内容（最多前25个字符）';
         PicNameExplain1.style.marginTop = '0.5rem';
         PicNameExplain1.style.marginBottom = '0';
         PicNameExplain1.style.whiteSpace = 'pre';
@@ -1374,6 +1674,104 @@
         PicNameExplain2.style.color = 'gray';
         question1.appendChild(PicNameExplain2);*/
         modal.appendChild(question1);
+
+        let questionPicFilter = document.createElement('p');
+        questionPicFilter.style.paddingLeft = '2rem';
+        questionPicFilter.style.paddingRight = '2rem';
+        questionPicFilter.style.marginTop = '1rem';
+        questionPicFilter.style.marginBottom = '0';
+        let questionPicFilterTitle = document.createElement('div');
+        questionPicFilterTitle.textContent = '图片方向过滤（只下载勾选的方向）：';
+        questionPicFilterTitle.style.fontWeight = 'bold';
+        questionPicFilterTitle.style.lineHeight = '2rem';
+        questionPicFilter.appendChild(questionPicFilterTitle);
+        [['enableDownloadLandscapePic', '横图（高小于宽）'], ['enableDownloadSquarePic', '方图（高宽相等）'], ['enableDownloadPortraitPic', '竖图（高大于宽）']].forEach(([settingKey, labelText]) => {
+            let label = document.createElement('label');
+            label.setAttribute('for', settingKey);
+            label.textContent = labelText;
+            label.style.display = 'inline-block';
+            label.style.paddingRight = '0.2rem';
+            questionPicFilter.appendChild(label);
+            let input = document.createElement('input');
+            input.type = 'checkbox';
+            input.id = settingKey;
+            input.name = settingKey;
+            input.checked = GM_getValue(settingKey, true);
+            questionPicFilter.appendChild(input);
+            questionPicFilter.appendChild(document.createElement('br'));
+        });
+        let picFilterExplain = document.createElement('p');
+        picFilterExplain.textContent = '只看封面图方向，整条动态判定：封面被过滤则整条跳过（不下载内部任何图），封面通过则全部下载；被过滤的动态不会标记为已下载。';
+        picFilterExplain.style.marginTop = '0.5rem';
+        picFilterExplain.style.marginBottom = '0';
+        picFilterExplain.style.color = 'gray';
+        picFilterExplain.style.lineHeight = '1.1rem';
+        questionPicFilter.appendChild(picFilterExplain);
+        modal.appendChild(questionPicFilter);
+
+        let questionSaveFolder = document.createElement('p');
+        questionSaveFolder.style.paddingLeft = '2rem';
+        questionSaveFolder.style.paddingRight = '2rem';
+        questionSaveFolder.style.marginTop = '1rem';
+        questionSaveFolder.style.marginBottom = '0';
+        let questionSaveFolderTitle = document.createElement('div');
+        questionSaveFolderTitle.textContent = '直接保存到指定文件夹：';
+        questionSaveFolderTitle.style.fontWeight = 'bold';
+        questionSaveFolderTitle.style.lineHeight = '2rem';
+        questionSaveFolder.appendChild(questionSaveFolderTitle);
+        let labelSaveToFolder = document.createElement('label');
+        labelSaveToFolder.setAttribute('for', 'saveToFolderEnabled');
+        labelSaveToFolder.textContent = '启用（仅Chromium系浏览器支持，如Chrome/Edge）';
+        labelSaveToFolder.style.display = 'inline-block';
+        labelSaveToFolder.style.paddingRight = '0.2rem';
+        questionSaveFolder.appendChild(labelSaveToFolder);
+        let inputSaveToFolder = document.createElement('input');
+        inputSaveToFolder.type = 'checkbox';
+        inputSaveToFolder.id = 'saveToFolderEnabled';
+        inputSaveToFolder.name = 'saveToFolderEnabled';
+        inputSaveToFolder.checked = GM_getValue('saveToFolderEnabled', false);
+        questionSaveFolder.appendChild(inputSaveToFolder);
+        questionSaveFolder.appendChild(document.createElement('br'));
+        let pickFolderButton = document.createElement('button');
+        pickFolderButton.textContent = '选择文件夹';
+        pickFolderButton.style.marginTop = '0.5rem';
+        pickFolderButton.style.marginRight = '0.5rem';
+        pickFolderButton.style.padding = '0.1rem 0.6rem';
+        pickFolderButton.style.borderStyle = 'solid';
+        pickFolderButton.style.borderWidth = '0.14rem';
+        pickFolderButton.style.borderColor = 'gray';
+        pickFolderButton.style.borderRadius = '0.2rem';
+        pickFolderButton.style.backgroundColor = 'white';
+        pickFolderButton.style.cursor = 'pointer';
+        let folderNameLabel = document.createElement('span');
+        folderNameLabel.style.color = 'gray';
+        folderNameLabel.textContent = GM_getValue('saveToFolderName', '') ? ('当前文件夹：' + GM_getValue('saveToFolderName', '')) : '尚未选择文件夹';
+        pickFolderButton.addEventListener('click', async function(event) {
+            if (typeof showDirectoryPicker !== 'function') {
+                alert('当前浏览器不支持直接保存到文件夹（需要Chromium系浏览器），将使用浏览器下载。');
+                return;
+            }
+            try {
+                const handle = await showDirectoryPicker({ id: 'bilibili-download', mode: 'readwrite' });
+                await saveFolderHandle(handle);
+                GM_setValue('saveToFolderName', handle.name);
+                folderNameLabel.textContent = '当前文件夹：' + handle.name;
+                inputSaveToFolder.checked = true;
+            } catch(e) {
+                // 用户取消选择或浏览器拒绝，保持原状。
+            }
+        });
+        questionSaveFolder.appendChild(pickFolderButton);
+        questionSaveFolder.appendChild(folderNameLabel);
+        let saveFolderExplain = document.createElement('p');
+        saveFolderExplain.textContent = '启用后文件直接写入所选文件夹，不经过浏览器下载、无保存弹窗；同名文件会被覆盖。\n浏览器不支持、未选择文件夹或未授权时，自动退回浏览器下载。\n刷新页面后首次下载时可能需要重新授权一次。';
+        saveFolderExplain.style.marginTop = '0.5rem';
+        saveFolderExplain.style.marginBottom = '0';
+        saveFolderExplain.style.whiteSpace = 'pre-wrap';
+        saveFolderExplain.style.color = 'gray';
+        saveFolderExplain.style.lineHeight = '1.1rem';
+        questionSaveFolder.appendChild(saveFolderExplain);
+        modal.appendChild(questionSaveFolder);
 
         let question2 = document.createElement('p');
         question2.style.paddingLeft = '2rem';
@@ -1688,7 +2086,7 @@
         inputListDownloadSleepGapSeconds.defaultValue = GM_getValue('listDownloadSleepGapSeconds', 2);
         question6.appendChild(inputListDownloadSleepGapSeconds);
         let listDownloadSleepGapSecondsExplain = document.createElement('p');
-        listDownloadSleepGapSecondsExplain.innerHTML = '此项设置每下载一个动态后等待的秒数，\n避免请求过于频繁而触发API限制。';
+        listDownloadSleepGapSecondsExplain.innerHTML = '此项设置每下载一个动态后等待的秒数，\n避免请求过于频繁而触发API限制。\n仅对产生真实下载的动态生效，被过滤\n整体跳过的动态不等待此间隔。';
         listDownloadSleepGapSecondsExplain.style.marginTop = '0.5rem';
         listDownloadSleepGapSecondsExplain.style.marginBottom = '0';
         listDownloadSleepGapSecondsExplain.style.whiteSpace = 'pre';
@@ -1934,6 +2332,12 @@
                 refreshFlag = true;
             }
             GM_setValue('dlPicName', document.getElementById('dlPicName').value);
+            GM_setValue('enableDownloadLandscapePic', document.getElementById('enableDownloadLandscapePic').checked);
+            GM_setValue('enableDownloadSquarePic', document.getElementById('enableDownloadSquarePic').checked);
+            GM_setValue('enableDownloadPortraitPic', document.getElementById('enableDownloadPortraitPic').checked);
+            GM_setValue('saveToFolderEnabled', document.getElementById('saveToFolderEnabled').checked);
+            // 确定按钮的点击手势尚在，趁机申请目录写入授权。
+            ensureFolderPermission();
             GM_setValue('enableVideoDownload', document.getElementById('enableVideoDownload').checked);
             GM_setValue('dlVidName', document.getElementById('dlVidName').value);
             // GM_setValue('retweetMode', document.getElementById('retweetMode').checked);
@@ -2004,6 +2408,18 @@
                         // console.log(node);
                         handleCard(node);
                     }
+                } else if (mutation.target.tagName === 'DIV' && mutation.target.closest('div.opus-feed')) {
+                    // 投稿图文页瀑布流：滚动加载与子tab切换新增的卡片。
+                    for (const node of mutation.addedNodes) {
+                        if (node.nodeType !== 1) continue;
+                        if (node.classList.contains('opus-card')) {
+                            addOpusFeedDownloadButton(node);
+                        } else {
+                            node.querySelectorAll('div.opus-card').forEach((card) => {
+                                addOpusFeedDownloadButton(card);
+                            });
+                        }
+                    }
                 } else if (GM_getValue('enableVideoDownload', true) && mutation.target.tagName === 'BODY') {
                     for (const node of mutation.addedNodes) {
                         if (node.nodeType === 1 && node.tagName === 'DIV'/* && node.classList.contains('lt-row')*/) {
@@ -2063,6 +2479,76 @@
         GM_registerMenuCommand('设置', showModal, "0");
     }
 
+    function showListErrorPrompt(contentDom, dynId, retryAttempts, cardTitle = null) {
+        // 非模态错误提示：右下角悬浮卡片代替confirm，等待用户决策期间页面可正常操作；瀑布流循环await此Promise暂停，出错卡片红框高亮便于定位。contentDom可为null（接口续页的条目尚未渲染到DOM），此时用cardTitle文本定位。
+        return new Promise(function(resolve) {
+            const oldOutline = contentDom ? contentDom.style.outline : null;
+            const oldOutlineOffset = contentDom ? contentDom.style.outlineOffset : null;
+            if (contentDom) {
+                contentDom.style.outline = '3px solid red';
+                contentDom.style.outlineOffset = '2px';
+            }
+            let promptCard = document.createElement('div');
+            promptCard.style.position = 'fixed';
+            promptCard.style.bottom = '0.5rem';
+            promptCard.style.right = '0.5rem';
+            promptCard.style.maxWidth = '24rem';
+            // 高于站点自身的浮层（如未登录横幅z-index=10000），避免提示被遮挡。
+            promptCard.style.zIndex = '2147483647';
+            promptCard.style.backgroundColor = 'white';
+            promptCard.style.borderStyle = 'solid';
+            promptCard.style.borderWidth = '0.15rem';
+            promptCard.style.borderColor = 'red';
+            promptCard.style.borderRadius = '0.5rem';
+            promptCard.style.padding = '0.6rem 0.8rem';
+            promptCard.style.fontSize = '0.8rem';
+            promptCard.style.lineHeight = '1.2rem';
+            promptCard.style.boxShadow = '0 0.2rem 0.6rem rgba(0, 0, 0, 0.3)';
+            let promptText = document.createElement('div');
+            promptText.style.whiteSpace = 'pre-wrap';
+            const promptTitle = (cardTitle !== null) ? cardTitle : getCardTitle(contentDom);
+            promptText.textContent = `动态「${promptTitle}」（id: ${dynId}）下载出错：${lastDownloadError?.message || lastDownloadError || '未知错误'}\n已重试 ${retryAttempts} 次，还要继续吗？${contentDom ? '（红框卡片即出错动态；等待期间可正常操作页面）' : '（该条尚未加载到页面；等待期间可正常操作页面）'}\n“跳过继续” —— 跳过此条继续下载（一般是接口限制了，建议跳过后手动下载保存）\n“停止下载” —— 停止整个瀑布流下载`;
+            promptCard.appendChild(promptText);
+            let buttonRow = document.createElement('div');
+            buttonRow.style.marginTop = '0.5rem';
+            buttonRow.style.textAlign = 'right';
+            const finish = (shouldContinue) => {
+                if (contentDom) {
+                    contentDom.style.outline = oldOutline;
+                    contentDom.style.outlineOffset = oldOutlineOffset;
+                }
+                promptCard.remove();
+                resolve(shouldContinue);
+            };
+            let skipButton = document.createElement('button');
+            skipButton.textContent = '跳过继续';
+            skipButton.style.marginRight = '0.5rem';
+            skipButton.style.padding = '0.2rem 0.8rem';
+            skipButton.style.borderStyle = 'solid';
+            skipButton.style.borderWidth = '0.1rem';
+            skipButton.style.borderColor = 'gray';
+            skipButton.style.borderRadius = '0.3rem';
+            skipButton.style.backgroundColor = 'white';
+            skipButton.style.cursor = 'pointer';
+            skipButton.addEventListener('click', () => finish(true));
+            buttonRow.appendChild(skipButton);
+            let stopButton = document.createElement('button');
+            stopButton.textContent = '停止下载';
+            stopButton.style.padding = '0.2rem 0.8rem';
+            stopButton.style.borderStyle = 'solid';
+            stopButton.style.borderWidth = '0.1rem';
+            stopButton.style.borderColor = 'red';
+            stopButton.style.borderRadius = '0.3rem';
+            stopButton.style.backgroundColor = 'white';
+            stopButton.style.color = 'red';
+            stopButton.style.cursor = 'pointer';
+            stopButton.addEventListener('click', () => finish(false));
+            buttonRow.appendChild(stopButton);
+            promptCard.appendChild(buttonRow);
+            document.body.appendChild(promptCard);
+        });
+    }
+
     let listDownloading = false;
     let stopDownloadingList = false;
     let listDownloadingIndex = 0;
@@ -2074,39 +2560,96 @@
             this.textContent = '停止下载瀑布流';
             this.disable = true;
             let retryAttempts = 0;
+            opusFeedState.apiDriven = false;
+            // 已处理过的动态id：DOM卡片与接口续页条目去重共用。
+            const processedIds = new Set();
+            let feedQueue = [];
+            let feedCursor = null;
+            let feedExhausted = false;
+            async function nextFeedItem() {
+                // 确定性续页：直接请求feed接口取下一页，has_more=false且队列排空才算真正结束；不依赖页面懒加载，后台标签页也能继续。
+                while (!stopDownloadingList) {
+                    while (feedQueue.length > 0) {
+                        const item = feedQueue.shift();
+                        if (item?.opus_id && !processedIds.has(item.opus_id)) return item;
+                    }
+                    if (feedExhausted) return null;
+                    if (!feedCursor) {
+                        opusFeedState.apiDriven = true;
+                        if (opusFeedState.seen) {
+                            if (!opusFeedState.hasMore) { feedExhausted = true; return null; }
+                            feedCursor = { page: opusFeedState.page + 1, offset: opusFeedState.offset, type: opusFeedState.type, hostMid: opusFeedState.hostMid };
+                        } else {
+                            // 钩子未捕获到页面请求（如脚本注入晚于首屏）：从第一页起步，靠processedIds去重。
+                            const activeTab = document.querySelector('.content-tab.active')?.textContent.trim();
+                            feedCursor = { page: 1, offset: '', type: (activeTab === '专栏') ? 'article' : ((activeTab === '动态') ? 'dynamic' : 'all'), hostMid: null };
+                        }
+                    }
+                    const hostMid = feedCursor.hostMid || window.location.pathname.match(/\/(\d+)\/upload\/opus/)?.[1];
+                    if (!hostMid) { feedExhausted = true; return null; }
+                    let data = null;
+                    for (let attempt = 0; attempt < 3 && !data && !stopDownloadingList; attempt++) {
+                        try {
+                            const response = await nativeFetch('https://api.bilibili.com/x/polymer/web-dynamic/v1/opus/feed/space?host_mid=' + hostMid + '&page=' + feedCursor.page + '&offset=' + feedCursor.offset + '&type=' + feedCursor.type, { credentials: 'include' });
+                            const json = await response.json();
+                            if (json?.code === 0 && json.data) data = json.data;
+                        } catch(err) { console.error(err); }
+                        if (!data) await sleep(1);
+                    }
+                    if (!data) throw new Error('获取瀑布流后续列表失败（网络错误或接口限制）');
+                    feedQueue = data.items || [];
+                    feedCursor.page += 1;
+                    feedCursor.offset = data.offset || '';
+                    feedExhausted = !data.has_more;
+                }
+                return null;
+            }
             while(!stopDownloadingList) {
                 const selfListDom = document.body.querySelector('div.bili-dyn-list');
-                if (selfListDom) {
+                // 投稿图文页没有bili-dyn-list，瀑布流容器是opus-feed。
+                const opusFeedDom = selfListDom ? null : document.body.querySelector('div.opus-feed');
+                if (selfListDom || opusFeedDom) {
                     // console.log(selfListDom);
-                    const contentDoms = selfListDom.querySelectorAll('div.bili-dyn-item__main');
+                    const contentDoms = selfListDom ? selfListDom.querySelectorAll('div.bili-dyn-item__main') : opusFeedDom.querySelectorAll('div.opus-card');
                     this.textContent = `停止下载瀑布流\n(正在下载第 ${(listDownloadingIndex + 1).toString()} 个动态)`;
                     const contentDom = contentDoms[listDownloadingIndex];
                     if (contentDom) {
                         contentDom.scrollIntoView();
                         // console.log(contentDom);
-                        const alreadyDownloaded = checkDynDownloaded(contentDom);
+                        const feedCardId = selfListDom ? null : getOpusFeedCardId(contentDom);
+                        const alreadyDownloaded = selfListDom ? checkDynDownloaded(contentDom) : (feedCardId ? GM_getValue('blDl-' + feedCardId, false) : false);
                         const downloadButton = contentDom.querySelector('div.download-button span');
                         if (downloadButton && ((!alreadyDownloaded) || (!GM_getValue('listDownloadSkipAlreadyDownloaded', true) && alreadyDownloaded)) && !(GM_getValue('listDownloadSkipReference', true) && contentDom.querySelector('div.reference'))) {
-                            const opusCard = contentDom.querySelector('div.dyn-card-opus');
-                            // console.log("opusCard: ", opusCard);
-                            const videoCard = contentDom.querySelector('a.bili-dyn-card-video');
-                            // console.log(videoCard);
                             let dynId;
-                            if (opusCard) {
-                                dynId = opusCard.$log?.click.value.card_id;
-                            } else if (videoCard) {
-                                dynId = videoCard.$log?.click.value.card_id;
+                            if (!selfListDom) {
+                                dynId = feedCardId;
+                            } else {
+                                const opusCard = contentDom.querySelector('div.dyn-card-opus');
+                                // console.log("opusCard: ", opusCard);
+                                const videoCard = contentDom.querySelector('a.bili-dyn-card-video');
+                                // console.log(videoCard);
+                                if (opusCard) {
+                                    dynId = opusCard.$log?.click.value.card_id;
+                                } else if (videoCard) {
+                                    dynId = videoCard.$log?.click.value.card_id;
+                                }
                             }
                             // console.log(dynId);
-                            if (dynId) {
-                                const downloadSuccess = await handleDynamicDownload(dynId, downloadButton);
+                            if (dynId) processedIds.add(dynId);
+                            let downloadSkipped = false;
+                            if (dynId && coverOrientationFiltered(contentDom)) {
+                                // 封面方向已被过滤：零请求直接跳过，不发详情API（也就不会因接口风控报错）。
+                                downloadSkipped = true;
+                            } else if (dynId) {
+                                const downloadSuccess = await handleDynamicDownload(dynId, downloadButton, contentDom);
+                                downloadSkipped = downloadSuccess === 'skipped';
                                 if (downloadSuccess) {
                                     retryAttempts = 0;
                                 } else {
                                     if (retryAttempts < GM_getValue('listDownloadRetryAttempsLimit', 3)) {
                                         listDownloadingIndex -= 1;
                                         retryAttempts += 1;
-                                    } else if (confirm(`出现错误${e.message}，已重试 ${retryAttempts} 次，还要继续吗？\n“确定” —— 跳过（一般是接口限制了，建议跳过，手动下载保存。B站真的很严格；\n“取消” —— 停止）`)) {
+                                    } else if (await showListErrorPrompt(contentDom, dynId, retryAttempts)) {
                                         // listDownloadingIndex -= 1;
                                         // retryAttempts += 1;
                                         retryAttempts = 0;
@@ -2115,11 +2658,64 @@
                                     }
                                 }
                             }
-                            await sleep(GM_getValue('listDownloadSleepGapSeconds', 3));
+                            // 下载间隔仅应用于产生了真实下载的动态；被过滤整体跳过的动态只做短暂停顿；已请求停止时不再等待。
+                            if (!stopDownloadingList) await sleep(downloadSkipped ? 0.3 : GM_getValue('listDownloadSleepGapSeconds', 3));
                         } else {
                             await sleep(0.3);
                         }
                         listDownloadingIndex += 1;
+                    } else if (!selfListDom) {
+                        // DOM卡片已处理完：改由feed接口确定性续页（has_more=false才是真结束），后台标签页页面不懒加载也不会误判完成。
+                        let feedItem = null;
+                        try {
+                            feedItem = await nextFeedItem();
+                        } catch(err) {
+                            console.error(err);
+                            lastDownloadError = err;
+                            if (await showListErrorPrompt(null, '瀑布流列表接口', retryAttempts, '获取后续列表失败')) {
+                                retryAttempts = 0;
+                                continue;
+                            }
+                            stopDownloadingList = true;
+                            continue;
+                        }
+                        if (!feedItem) {
+                            stopDownloadingList = true;
+                            continue;
+                        }
+                        const feedId = feedItem.opus_id;
+                        processedIds.add(feedId);
+                        this.textContent = `停止下载瀑布流\n(正在下载第 ${(listDownloadingIndex + 1).toString()} 个动态)`;
+                        listDownloadingIndex += 1;
+                        if (GM_getValue('listDownloadSkipAlreadyDownloaded', true) && GM_getValue('blDl-' + feedId, false)) {
+                            await sleep(0.3);
+                            continue;
+                        }
+                        let feedSkipped = false;
+                        if (feedItem.cover?.width > 0 && feedItem.cover?.height > 0 && !orientationAllowedByRatio(feedItem.cover.width, feedItem.cover.height)) {
+                            // 接口条目自带封面原始宽高：方向被过滤则零请求跳过。
+                            feedSkipped = true;
+                        } else {
+                            const feedSuccess = await handleDynamicDownload(feedId, null, null);
+                            feedSkipped = feedSuccess === 'skipped';
+                            if (!feedSuccess) {
+                                if (retryAttempts < GM_getValue('listDownloadRetryAttempsLimit', 3)) {
+                                    retryAttempts += 1;
+                                    feedQueue.unshift(feedItem);
+                                    processedIds.delete(feedId);
+                                    listDownloadingIndex -= 1;
+                                    continue;
+                                }
+                                const feedTitle = (feedItem.content || '').trim().replace(/\s+/g, ' ');
+                                if (await showListErrorPrompt(null, feedId, retryAttempts, feedTitle ? (feedTitle.length > 30 ? feedTitle.substring(0, 30) + '…' : feedTitle) : '（无标题）')) {
+                                    retryAttempts = 0;
+                                } else {
+                                    stopDownloadingList = true;
+                                }
+                            }
+                        }
+                        if (!stopDownloadingList) await sleep(feedSkipped ? 0.3 : GM_getValue('listDownloadSleepGapSeconds', 3));
+                        continue;
                     } else {
                         stopDownloadingList = true;
                     }
@@ -2182,7 +2778,8 @@
     }
 
     function showListDownloadButton() {
-        if (((window.location.host === 'space.bilibili.com') && window.location.pathname.match(/^\/\d+\/dynamic$/)) || ((window.location.host === 't.bilibili.com') && (window.location.pathname === '/'))) {
+        // 路径允许带语言前缀（如 /zh-Hans/415470107/upload/opus）。
+        if (((window.location.host === 'space.bilibili.com') && window.location.pathname.match(/^\/(?:[a-zA-Z-]+\/)?\d+\/dynamic$/)) || ((window.location.host === 'space.bilibili.com') && window.location.pathname.match(/^\/(?:[a-zA-Z-]+\/)?\d+\/upload\/opus/)) || ((window.location.host === 't.bilibili.com') && (window.location.pathname === '/'))) {
             const listDownloadButton = document.getElementById('listDownloadButton');
             if (listDownloadButton) {
                 listDownloadButton.style.display = 'block';

@@ -3,8 +3,11 @@
 # Download Pictures and Videos from Bilibili Timeline
 A Tampermonkey script to download pictures from Bilibili timeline. Also able to download videos from timeline and play page.
 It could download Bilibili DASH video/audio streams in highest quality available and merges them into a single MP4 file **entirely in the browser** using ffmpeg.wasm.
-The filenames could be modified as you like in the settings pannel.
+The filenames could be modified as you like in the settings pannel. Pictures are named after the dynamic title by default (`{title}.{ext}`): the original filename is used when there is no title, and automatically appended as a suffix on name collisions to avoid overwriting.
+Posts can be filtered by cover-picture orientation (landscape / square / portrait) in the settings panel: only the cover is checked, a filtered cover skips the whole post while a passing cover downloads all its pictures; orientation is determined solely from API metadata or already-loaded thumbnails, never sending extra network requests. The auto-download interval applies only to posts that actually download files; filtered posts are skipped without waiting.
 Able to download from timeline one by one automatically.
+Also supports the uploader's opus page (`space.bilibili.com/<uid>/upload/opus`): per-card download buttons on the picture grid, waterfall auto-download, and full-body picture extraction for article-type opus.
+Optional "save directly to a chosen folder" mode (Chromium-based browsers only, e.g. Chrome/Edge): after granting access once, files are written straight into the folder without browser downloads or per-file save prompts; falls back to browser downloads when unsupported or unauthorized.
 
 ## Download:
 - Go to [Greasy Fork](https://greasyfork.org/zh-CN/scripts/421885).
