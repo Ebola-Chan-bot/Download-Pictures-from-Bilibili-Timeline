@@ -808,32 +808,43 @@
     }
 
     function coverOrientationAllowedFromItem(item) {
-        // 方向过滤只看封面（详情API里的第一张图），整条动态判定，不逐张考虑内部其它图；宽高缺失时无法判断，放行。
+        // 封面（详情API里的第一张图）决定整条动态是否零请求跳过；宽高缺失时无法判断，放行。
         const major = item.modules.module_dynamic.major;
         const cover = major.opus?.pics?.[0] || major.draw?.items?.[0];
         if (!(cover?.width > 0) || !(cover?.height > 0)) return true;
         return orientationAllowedByRatio(cover.width, cover.height);
     }
 
+    function pictureOrientationAllowed(picture) {
+        // 内部图逐张方向过滤：只用已有宽高元数据判定，缺失时无法判断则放行（绝不为获取尺寸发额外请求）。
+        if (!(picture?.width > 0) || !(picture?.height > 0)) return true;
+        return orientationAllowedByRatio(picture.width, picture.height);
+    }
+
     async function handleImageDynamic(item) {
         const pictures = item.modules.module_dynamic.major.opus.pics || item.modules.module_dynamic.major.draw.items;
         // console.log(pictures);
         if (Array.isArray(pictures)) {
-            // 封面方向被过滤时整条按“跳过”处理，不标记已下载；封面通过则下载全部图片。
+            // 封面方向被过滤时整条按“跳过”处理，不标记已下载；封面通过后内部不符合方向的图也逐张过滤不下载。
             if (pictures.length > 0 && !coverOrientationAllowedFromItem(item)) return true;
+            let downloadCount = 0;
             await Promise.all(pictures.map(function(picture, index) {
                 // console.log(picture);
+                if (!pictureOrientationAllowed(picture)) return;
+                downloadCount += 1;
                 const pictureUrl = picture.url || picture.src;
                 const originalName = pictureUrl.split('/')[pictureUrl.split('/').length - 1];
                 const pictureName = getPicName(GM_getValue('dlPicName', '{title}.{ext}'), originalName, index + 1, item);
                 return downloadWrapper(pictureUrl, pictureName);
             }));
+            // 全部内部图都被过滤（无任何真实下载）时按跳过处理，不标记已下载。
+            if (pictures.length > 0 && downloadCount === 0) return true;
         }
     }
 
     async function handleArticleOpusDynamic(item) {
         // 专栏型opus的详情API只返回封面图，正文图片需从opus页面的服务端渲染HTML中解析。
-        // 方向过滤只看封面（详情API的opus.pics[0]即封面）：被过滤则整条跳过，连专栏页面请求都不发。
+        // 封面（详情API的opus.pics[0]）被过滤则整条跳过，连专栏页面请求都不发；通过后正文图再逐张按方向过滤。
         if (!coverOrientationAllowedFromItem(item)) return true;
         const dynId = item.id_str;
         downloadQueueTitle.style.display = 'block';
@@ -847,7 +858,7 @@
         if (!html) throw new Error('无法获取专栏页面: ' + dynId);
         const pictureList = [];
         const seenUrls = new Set();
-        const pushPicture = (rawUrl) => {
+        const pushPicture = (rawUrl, width, height) => {
             let pictureUrl = (rawUrl || '').split('@')[0];
             if (pictureUrl.startsWith('//')) pictureUrl = 'https:' + pictureUrl;
             if (!pictureUrl.startsWith('http://') && !pictureUrl.startsWith('https://')) return;
@@ -855,7 +866,8 @@
             if (pictureUrl.includes('02db465212d3c374a43c60fa2625cc1caeaab796')) return;
             if (seenUrls.has(pictureUrl)) return;
             seenUrls.add(pictureUrl);
-            pictureList.push(pictureUrl);
+            // 携带宽高元数据供逐张方向过滤；DOM兜底路径无宽高时为NaN，判定时放行。
+            pictureList.push({ url: pictureUrl, width: width, height: height });
         };
         // 优先从页面注入的 __INITIAL_STATE__ 段落数据取正文图，比解析渲染DOM可靠。
         let paragraphs = null;
@@ -868,23 +880,29 @@
         }
         if (Array.isArray(paragraphs)) {
             paragraphs.forEach((paragraph) => {
-                (paragraph?.pic?.pics || []).forEach((picture) => pushPicture(picture.url));
+                (paragraph?.pic?.pics || []).forEach((picture) => pushPicture(picture.url, picture.width, picture.height));
             });
         } else {
-            // 兜底：直接解析服务端渲染DOM中的正文图片。
+            // 兜底：直接解析服务端渲染DOM中的正文图片（属性带宽高则用，没有则判定时放行）。
             const doc = new DOMParser().parseFromString(html, 'text/html');
-            doc.querySelectorAll('div.opus-para-pic img').forEach((img) => pushPicture(img.getAttribute('src') || img.getAttribute('data-src')));
+            doc.querySelectorAll('div.opus-para-pic img').forEach((img) => pushPicture(img.getAttribute('src') || img.getAttribute('data-src'), Number(img.getAttribute('width')), Number(img.getAttribute('height'))));
         }
         if (pictureList.length === 0) {
             // 正文没有图片（纯文字专栏或页面结构变化）时，退回下载API返回的封面图。
             return await handleImageDynamic(item);
         }
-        // 封面已通过方向过滤，正文全部图片直接下载，不再逐张判定。
-        await Promise.all(pictureList.map(function(pictureUrl, index) {
+        // 封面已通过方向过滤；正文图再按各自宽高元数据逐张过滤，不符合方向的不下载。
+        let downloadCount = 0;
+        await Promise.all(pictureList.map(function(picture, index) {
+            if (!pictureOrientationAllowed(picture)) return;
+            downloadCount += 1;
+            const pictureUrl = picture.url;
             const originalName = pictureUrl.split('/')[pictureUrl.split('/').length - 1];
             const pictureName = getPicName(GM_getValue('dlPicName', '{title}.{ext}'), originalName, index + 1, item);
             return downloadWrapper(pictureUrl, pictureName);
         }));
+        // 正文图全部被过滤（无任何真实下载）时按跳过处理，不标记已下载。
+        if (downloadCount === 0) return true;
     }
 
     // For 'https://api.vc.bilibili.com/dynamic_svr/v1/dynamic_svr/get_dynamic_detail?dynamic_id=' + dynId
@@ -1285,7 +1303,7 @@
     }
 
     function coverOrientationFiltered(contentDom) {
-        // 用卡片上已加载的封面缩略图判断方向是否被过滤（零请求；缩略图比例是原图比例夹逼到[75%,131%]，方向判定可靠）。过滤只看封面，命中则整条跳过，不考虑内部其它图。
+        // 用卡片上已加载的封面缩略图判断方向是否被过滤（零请求；缩略图比例是原图比例夹逼到[75%,131%]，方向判定可靠）。封面命中则整条跳过；封面通过时内部图的逐张过滤在获取元数据后进行。
         if (!contentDom || contentDom.querySelector('a.bili-dyn-card-video, div.bili-dyn-card-video')) return false;
         const coverImg = [...contentDom.querySelectorAll('img')].find((img) => img.complete && img.naturalWidth > 0 && img.naturalHeight > 0 && /new_dyn|\/bfs\/article\//.test(img.src));
         if (!coverImg) return false;
@@ -1747,7 +1765,7 @@
             questionPicFilter.appendChild(document.createElement('br'));
         });
         let picFilterExplain = document.createElement('p');
-        picFilterExplain.textContent = '只看封面图方向，整条动态判定：封面被过滤则整条跳过（不下载内部任何图），封面通过则全部下载；被过滤的动态不会标记为已下载。';
+        picFilterExplain.textContent = '封面被过滤则整条跳过（不发请求）；封面通过后内部图再逐张按方向过滤，不符合的不下载（只用元数据判定，无宽高的图放行）；整条无任何图被下载时不会标记为已下载。';
         picFilterExplain.style.marginTop = '0.5rem';
         picFilterExplain.style.marginBottom = '0';
         picFilterExplain.style.color = 'gray';
