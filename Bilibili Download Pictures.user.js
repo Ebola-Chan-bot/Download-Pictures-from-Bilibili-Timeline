@@ -106,12 +106,58 @@
     progressBar.appendChild(progressCloseBtn);
     // downloadQueueCard.appendChild(progressBar);
 
+    // 后台计时：隐藏标签页的页面 setTimeout 会被浏览器节流（Chromium 隐藏 5 分钟后最低每分钟一次），Worker 内的定时器不受此限制；创建失败时退回页面定时器。
+    let sleepWorker = null;
+    const sleepWaiters = new Map();
+    let sleepTicket = 0;
+    function getSleepWorker() {
+        if (sleepWorker !== null) return sleepWorker || null;
+        try {
+            const blob = new Blob(['onmessage=function(e){setTimeout(function(){postMessage(e.data);},e.data.ms);};'], { type: 'text/javascript' });
+            sleepWorker = new Worker(URL.createObjectURL(blob));
+            sleepWorker.onmessage = (e) => {
+                const resolve = sleepWaiters.get(e.data.id);
+                if (resolve) { sleepWaiters.delete(e.data.id); resolve(); }
+            };
+        } catch(e) { console.error(e); sleepWorker = false; }
+        return sleepWorker || null;
+    }
+
     function sleep(seconds) {
         return new Promise((resolve) => {
-            setTimeout(() => {
-                resolve();
-            }, seconds * 1000);
+            const worker = getSleepWorker();
+            if (worker) {
+                const id = ++sleepTicket;
+                sleepWaiters.set(id, resolve);
+                worker.postMessage({ id: id, ms: seconds * 1000 });
+            } else {
+                setTimeout(resolve, seconds * 1000);
+            }
         });
+    }
+
+    // 后台保活：播放人耳几乎不可闻的低频低音量音频，让标签页被浏览器判定为“正在播放声音”，从而豁免后台冻结与节能丢弃；仅在瀑布流下载期间开启（需在用户点击手势内创建）。
+    let keepAliveAudio = null;
+    function startBackgroundKeepAlive() {
+        if (keepAliveAudio) return;
+        try {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const oscillator = ctx.createOscillator();
+            const gain = ctx.createGain();
+            // 20Hz 低频 + 0.01 振幅：信号非零足以触发“有声”判定，人耳几乎不可闻；完全静音（gain=0）会被判定为无声而失去豁免。
+            oscillator.frequency.value = 20;
+            gain.gain.value = 0.01;
+            oscillator.connect(gain);
+            gain.connect(ctx.destination);
+            oscillator.start();
+            ctx.resume().catch(() => {});
+            keepAliveAudio = { ctx: ctx, oscillator: oscillator };
+        } catch(e) { console.error(e); }
+    }
+    function stopBackgroundKeepAlive() {
+        if (!keepAliveAudio) return;
+        try { keepAliveAudio.oscillator.stop(); keepAliveAudio.ctx.close(); } catch(e) { console.error(e); }
+        keepAliveAudio = null;
     }
 
     // 投稿图文页瀑布流分页状态：钩住页面自身的feed请求，确定性记录has_more与游标；后台标签页页面不懒加载时，由脚本自行调接口续页，不靠超时猜测结束。
@@ -2560,6 +2606,8 @@
             this.textContent = '停止下载瀑布流';
             this.disable = true;
             let retryAttempts = 0;
+            // 点击手势内立即开启后台保活，防止长时间下载中标签页被冻结/丢弃。
+            startBackgroundKeepAlive();
             opusFeedState.apiDriven = false;
             // 已处理过的动态id：DOM卡片与接口续页条目去重共用。
             const processedIds = new Set();
@@ -2723,6 +2771,7 @@
                     stopDownloadingList = true;
                 }
             }
+            stopBackgroundKeepAlive();
             listDownloading = false;
             stopDownloadingList = false;
             retryAttempts = 0;
